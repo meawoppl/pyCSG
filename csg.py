@@ -1,8 +1,9 @@
-import itertools
+import itertools, md5
 import numpy as np
 
 # CSG Library for Python
 # Modeled after: https://github.com/evanw/csg.js/blob/master/csg.js
+
 
 def unit(array):
     return array / np.linalg.norm(array)
@@ -14,6 +15,11 @@ class Vertex(object):
     def __init__(self, position, normal):
         self.pos = np.array(position, dtype=np.float64, copy=True).squeeze()
         self.normal = unit( np.array(normal, dtype=np.float64, copy=True).squeeze() )
+
+    @staticmethod
+    def fromXYZ(x, y, z):
+        pos = np.array([x,y,z])
+        return Vertex(pos, np.ones(3))
 
     def flip(self):
         self.normal *= -1
@@ -47,6 +53,7 @@ class Plane(object):
         return Plane(self.normal, self.w)
      
     def splitPolygon(self, polygon):
+        '''Take a polygon in, and split it by my plane into coplanar and front/back categories.'''
         COPLANAR = 0
         FRONT = 1
         BACK = 2
@@ -73,14 +80,14 @@ class Plane(object):
 
         # If the polygon is in the back or front of a plane, append it as such
         if   polyType == FRONT:
-            f.append(polygon)
+            f.append( polygon )
         elif polyType == BACK:
-            b.append(polygon)
+            b.append( polygon )
         elif polyType == COPLANAR:
             if np.dot(self.normal, polygon.plane.normal) > 0:
-                cf.append(polygon)
+                cf.append( polygon )
             else:
-                cb.append(polygon)
+                cb.append( polygon )
                 
         elif polyType == SPANNING:
             newFront = []
@@ -99,8 +106,8 @@ class Plane(object):
                 vj = polygon.vertices[vertIndx2]
 
                 # If the vertex is in front or back, stick it there.
-                if ti != BACK: newFront.append(vi.copy())
-                if ti != FRONT: newBack.append(vi.copy())
+                if ti != BACK: newFront.append( vi )
+                if ti != FRONT: newBack.append( vi )
                 
                 # If the current edge spans the cut plane
                 if (ti | tj) == SPANNING:
@@ -119,21 +126,50 @@ class Plane(object):
 
         return cf, cb, f, b
 
+
+def planeCoalesce(polygons):
+    edgeCount = {}
+
+    vc = UniqueVertexCollector()
+
+    for polygon in polygons:
+        nVertices = len(polygon.vertices)
+        for i in xrange(nVertices):
+            j = (i + 1) % nVertices
+            v1 = polygon.vertices[i]
+            v2 = polygon.vertices[j]
+            
+            # Put the vertices them in a arbitrary to index 
+            vi1 = vc.addVertex(v1.pos)
+            vi2 = vc.addVertex(v2.pos)
+            
+            edge_tuple = tuple(sorted([vi1, vi2]))
+
+            edgeCount[edge_tuple] = edgeCount.get(edge_tuple, 0) + 1
+
+
+
+
 class Polygon(object):
-    def __init__(self, vertices, shared={}, color=None):
+    def __init__(self, vertices, shared={}):
         self.vertices = vertices + []
         self.shared = shared.copy()
-        if (not color) and ("color" not in shared): 
+        if "color" not in shared: 
             self.shared["color"] = (0.5, 0.5, 0.5) # Grey if otherwise unlabeled
+        
 
         self.plane = Plane.fromPoints(vertices[0].pos, vertices[1].pos, vertices[2].pos)
+
+        m = md5.new()
+        m.update("".join([v.pos.tostring() for v in self.vertices]))
+        self._hash = abs(long(m.hexdigest(), 16))
 
     def fromArray(ndarray):
         vertices = [Vertex(tri) for tri in ndarray]
         return Polygon(vertices)
 
     def copy(self):
-        return Polygon(vertices.copy(), shared.copy())
+        return Polygon(self.vertices + [], self.shared.copy())
 
     def flip(self):
         # Flip the order (and hence computed normal)
@@ -143,7 +179,22 @@ class Polygon(object):
         for  v in self.vertices: v.flip()
 
     def __str__(self):
-        return "pyCSG Polygon with %i vertices" % len(self.vertices)
+        printable = ["\t" + str(v.pos) for v in self.vertices]
+        return "\n".join(["pyCSG Polygon with %i vertices" % len(self.vertices)] + printable )
+
+    def __eq__(self, other):
+        # Make sure a pair of polygons have the same point count
+        if len(self.vertices) != len(other.vertices):
+            return False
+        
+        # Make sure each of the points is the same
+        for vtx1, vtx2 in zip(self.vertices, other.vertices):
+            if not all(vtx1.pos == vtx2.pos):
+                return False
+        return True
+
+    def __hash__(self):        
+        return self._hash
 
 
 class UniqueVertexCollector(object):
@@ -167,6 +218,8 @@ class UniqueVertexCollector(object):
         self.indexVertex[self.indexCount] = vertex
         self.indexCount += 1
 
+        return self.indexCount - 1
+
     def getVertex(self, index):
         return self.indexVertex[index]
 
@@ -185,17 +238,36 @@ class UniqueVertexCollector(object):
         return vc
         
 
-
-
-
 class PolygonMesh(object):
     def __init__(self, polygonList = []):
         self.polygons = polygonList
 
     def writeOBJ(self, filename):
+        m = open("colors.mtl", "w")
+
+        # m.write(""
+        # Figure out what all colors we are using
+        def tupleToColorString(colorTuple):
+            return "color" + "_".join(["%0.2f" % c for c in colorTuple])
+
+        colorsWritten = set()
+        for polygon in self.polygons:
+            polygonColor = polygon.shared["color"]
+            if polygonColor in colorsWritten:
+                continue
+            m.write("newmtl " + tupleToColorString(polygonColor) + "\n")
+            m.write("Ka %f %f %f\n" % polygonColor)
+            m.write("Kd %f %f %f\n" % polygonColor)
+            m.write("illum 2\n")
+            m.write("\n")
+            colorsWritten.add(polygonColor)
+        
+        m.close()
+
         f = open(filename, "w")
         f.write("# Created by pyCSG\n")
-
+        f.write("mtllib colors.mtl\n")
+        
         # Get the unique vertices
         vc = UniqueVertexCollector.fromPolygonList(self.polygons)
 
@@ -205,6 +277,8 @@ class PolygonMesh(object):
 
         # Write the face indices
         for polygon in self.polygons:
+            # Tell it to use the right color
+            f.write("usemtl " + tupleToColorString(polygon.shared["color"]) + "\n")
             # .obj is 1 based hence the +1
             vIndices = [str(vc.getIndex(v.pos) + 1) for v in polygon.vertices]
             f.write( "f " + " ".join(vIndices) + "\n" )
@@ -285,10 +359,10 @@ class PolygonMesh(object):
 
 
     def __sub__(self, otherMesh):
-        t1 = BSPNode(self.polygons );
-        t2 = BSPNode(otherMesh.polygons );
+        t1 = BSPNode(   self.polygons    )
+        t2 = BSPNode( otherMesh.polygons )
         
-        t1.invert();
+        t1.invert()
         t1.clipTo(t2)
         t2.clipTo(t1)
         t2.invert()
@@ -300,7 +374,27 @@ class PolygonMesh(object):
         return PolygonMesh(t1.allPolygons())
 
 
-        
+def union( *meshes ):
+    print meshes
+
+    bsps = [BSPNode(m.polygons) for m in meshes]
+
+
+    for bsp1, bsp2 in itertools.combinations(bsps, 2):
+        bsp1.clipTo(bsp2)
+        bsp2.clipTo(bsp1)
+
+        print bsp1, bsp2
+    
+
+    mergeBSP = bsps[0]
+    for bsp in bsps[1:]:
+        bsp.invert()
+        bsp.clipTo(mergeBSP)
+        bsp.invert()
+        mergeBSP.build(bsp.allPolygons())
+
+    return PolygonMesh(mergeBSP.allPolygons())
 
 
 
@@ -337,6 +431,7 @@ class BSPNode(object):
 
     
     def clipTo(self, otherBSP):
+        '''Clip all the polygons in this tree with respect to another tree.'''
         # My new polygons are those clipped against the tree passed
         self.polygons = otherBSP.clipPolygons(self.polygons)
 
@@ -346,8 +441,11 @@ class BSPNode(object):
 
     def clipPolygons(self, polygons):
         # If a node lacks a splitting plane, then it is a leaf, so no clipping
-        if not self.plane: return polygons[:]
-        
+        if not self.plane: return polygons
+
+        # A list that keys a single polygon to its child (split) polygons
+        parentChildList = {}
+
         fr, bk = [], []
         # For each polygon
         for polygon in polygons:
@@ -356,8 +454,13 @@ class BSPNode(object):
             fr += cFront + front
             bk += cBack  + back
 
-        # The generated polygons that are in front of 
-        # me might need to further be clipped by other obects in front of me
+            # If a polygon gets split (becomes more than one polygon)
+            if len(fr + bk) > 1: 
+                parentChildList[polygon] = fr + bk
+                print "Cut detected", hash(polygon)
+
+        # The generated polygons that are in front/back of  me might
+        # need to further be clipped by other obects in front of me
         if self.front: 
             fr = self.front.clipPolygons(fr)
         if self.back: 
@@ -368,10 +471,30 @@ class BSPNode(object):
             # but now there is nothing behind me in the BPS they can be discarded
             bk = []
 
-        return fr + bk
+        survivingPolygons = fr + bk
+        # Lastly we check if all the child polygons are still in this bsp after slicing 
+        # for parent, children in parentChildList.iteritems():
+        #     figure()
+        #     print hash(parent), [hash(child) for child in children]
+        #     # Make sure that all of the child polygons are still around
+        #     allChildrenAlive = all([child in survivingPolygons for child in children])
+        #     if not allChildrenAlive: 
+        #         parent.shared["color"] = (1,0,0)
+        #         continue
+
+        #     print "All Children Alive", hash(parent)
+        #     for child in children: 
+        #         survivingPolygons.remove(child)
+        #         # for vtx in child.vertices:
+
+        #     parent.shared["color"] = (0,1,0)
+        #     survivingPolygons.append(parent)
+
+        return survivingPolygons
 
         
     def build(self, polygons):
+        '''Build up this bsp tree based on the passed polygons.'''
         if len(polygons) == 0: return
 
         # Assign this node a cutting plane if it does not already exist.
@@ -387,21 +510,19 @@ class BSPNode(object):
             # Collect the coplanar ones on this node
             self.polygons += cFront + cBack
 
-            # Pile up the front and back ones
+            # Pile up the front and back ones to push down the front/back BSP's
             newFront += front
             newBack  += back
             
         if len(newFront) != 0:
             # Init a new node if necessary
             if not self.front: self.front = BSPNode()
-            
             # Push Polys up the tree
             self.front.build(newFront)
 
         if len(newBack) != 0:
             # Init a new node if necessary
             if not self.back: self.back = BSPNode()
-
             # Push Polys up the tree
             self.back.build(newBack)
 
@@ -416,6 +537,7 @@ def makeSphere(center, radius, nTheta, nPhi):
         z = np.sin(phi) * radius
         return np.array([x, y, z], dtype=np.float64)
 
+    clr = randomColor()
     polyCollection = []
     for phiIndx in range(nPhi)[:-1]:
         for thetaIndx in range(nTheta)[:-1]:
@@ -435,19 +557,21 @@ def makeSphere(center, radius, nTheta, nPhi):
             v3 = Vertex( p3, unit(p3)  )
             v4 = Vertex( p4, unit(p4)  )
 
-            if (np.allclose(v1.pos, v2.pos) or np.allclose(v2.pos, v3.pos) or np.allclose(v1.pos, v2.pos)  ): 
-                pass
-            else:
-                polyCollection.append( Polygon([v1, v2, v3], color=(1,0,0)) )
-
-            if (np.allclose(v3.pos, v2.pos) or np.allclose(v2.pos, v4.pos) or np.allclose(v3.pos, v4.pos)  ): 
-                pass
-            else:
-                polyCollection.append( Polygon([v3, v2, v4], color=(1,0,0)) )
-
+            dup123 = (np.allclose(v1.pos, v2.pos) or np.allclose(v2.pos, v3.pos) or np.allclose(v1.pos, v2.pos)  )
+            if not dup123:
+                polyCollection.append( Polygon([v1, v2, v3], {"color":clr} ))
+                
+            dupe324 = (np.allclose(v3.pos, v2.pos) or np.allclose(v2.pos, v4.pos) or np.allclose(v3.pos, v4.pos)  )
+            if not dupe324:
+                polyCollection.append( Polygon([v3, v2, v4], {"color":clr} ))
 
     return PolygonMesh(polyCollection)
-            
+
+
+def randomColor():
+    import random
+    # MRG FIXME
+    return (0.5, 0.5, 0.5) # tuple([random.uniform(0,1) for r in range(3)])
 
 
 def makeTetrahedron(center):
@@ -468,36 +592,78 @@ def makeTetrahedron(center):
         ver = Vertex(pt, unit(pt))
         tetVerts.append(ver)
 
+    clr = randomColor()
     polys = []
-    polys.append( Polygon( [tetVerts[0], tetVerts[2], tetVerts[1]] ) )
-    polys.append( Polygon( [tetVerts[1], tetVerts[2], tetVerts[3]] ) ) 
-    polys.append( Polygon( [tetVerts[0], tetVerts[1], tetVerts[3]] ) ) 
-    polys.append( Polygon( [tetVerts[0], tetVerts[3], tetVerts[2]] ) ) 
+    polys.append( Polygon( [tetVerts[0], tetVerts[2], tetVerts[1]] , {"color":clr} ) )
+    polys.append( Polygon( [tetVerts[1], tetVerts[2], tetVerts[3]] , {"color":clr} ) ) 
+    polys.append( Polygon( [tetVerts[0], tetVerts[1], tetVerts[3]] , {"color":clr} ) ) 
+    polys.append( Polygon( [tetVerts[0], tetVerts[3], tetVerts[2]] , {"color":clr} ) ) 
 
     return PolygonMesh(polys)
 
 
 def testOperators(m1, m2, name):
-    sup = PolygonMesh(m1.polygons + m2.polygons)
-    sup.writePLY(name + "-super.ply")
-    sup.writeOBJ(name + "-super.obj")
+    # sup = PolygonMesh(m1.polygons + m2.polygons)
+    # sup.writePLY(name + "-super.ply")
+    # sup.writeOBJ(name + "-super.obj")
 
     union = m1 | m2
-    union.writePLY(name + "-union.ply")
+    # union.writePLY(name + "-union.ply")
     union.writeOBJ(name + "-union.obj")
 
-    sub = m1 - m2
-    sub.writePLY(name + "-sub.ply")
-    sub.writeOBJ(name + "-sub.obj")
+    # sub = m1 - m2
+    # sub.writePLY(name + "-sub.ply")
+    # sub.writeOBJ(name + "-sub.obj")
 
-    intersect = m1 & m2
-    intersect.writePLY(name + "-int.ply")
-    intersect.writeOBJ(name + "-int.obj")
+    # intersect = m1 & m2
+    # intersect.writePLY(name + "-int.ply")
+    # intersect.writeOBJ(name + "-int.obj")
+
+
+
+def doVasculature(filename):
+    xs, ys, zs, rs = np.load(filename).T
+
+    sortr = rs.argsort()[::-1]
+
+    xyz = np.c_[xs, ys, zs]
+
+    xyz = xyz[sortr,:]
+    rs  = rs[sortr]
+
+    msh = PolygonMesh()
+    for i in range(len(rs)):
+        msh |= makeSphere(xyz[i], rs[i], 4, 4)
+        print i, rs[i]
+        
+        if (i != 0) and (i % 25 == 0):
+            msh.writeOBJ("vasculature-test-%i.obj" % i)
+
+
 
 
 if __name__ == "__main__":
-    t5 = makeSphere(np.zeros(3), 1.0, 15, 15)
-    t6 = makeSphere(np.ones(3), 1, 15, 15)
+    # doVasculature("spheres.npy")
+    # t5 = makeSphere(np.zeros(3), 1.0, 7, 7)
+    # t6 = makeSphere(np.ones(3), 1, 7, 7)
 
-    testOperators(t5, t6, "sphere")
+    import meshIO
+    m1 = meshIO.loadABA("grey.msh")
+    m2 = makeSphere(np.array([2941, 3325, 2549]), 1000, 10, 10)
+
+    over = PolygonMesh(m1.polygons + m2.polygons)
+    over.writeOBJ("brain-super.obj")
     
+    m3 = m1 - m2
+    m3.writeOBJ("brain-minus-sphere.obj")
+
+    t1 = makeTetrahedron(np.array([0,0,0]))
+    t2 = makeTetrahedron(np.array([0,0,np.sqrt(2)+0.1]))
+    testOperators(t1, t2, "tet")
+
+    # meshes = []
+    # meshes = [makeSphere(np.ones(3)*0.5*x, 1, 5, 5) for x in range(10)]
+
+    # result = union(*tuple(meshes))
+
+    # result.writeOBJ("sphere-merge.obj")
